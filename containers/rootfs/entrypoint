@@ -1,0 +1,188 @@
+#!/bin/sh
+# SELF-Rsync 容器入口.
+#
+#   (无参数) / server   rsync 守护进程: 把 SYNC_PATH (默认 /data) 以只读 module 发布到 873 端口
+#   client              先从 SERVER 拉一份完整副本到 SYNC_PATH, 对端没就绪就按退避一直重试,
+#                       之后每 SYNC_INTERVAL 秒同步一次 (单轮最多尝试 SYNC_RETRIES 次)
+#
+# 配置项全部有默认值, 默认行为与旧镜像 (nushell 入口 + busybox crond + /etc/periodic) 一致,
+# 说明见 README.md. /etc/rsyncd.conf 与两个 secrets 文件只在不存在时生成, 挂载自定义文件会被沿用.
+
+set -u
+
+SYNC_USER=${SYNC_USER:-container-user}
+SYNC_PASSWORD=${SYNC_PASSWORD:-container-password}
+SYNC_MODULE=${SYNC_MODULE:-volume}
+SYNC_PATH=${SYNC_PATH:-/data}
+SYNC_BWLIMIT=${SYNC_BWLIMIT:-128}
+SYNC_INTERVAL=${SYNC_INTERVAL:-86400}
+SYNC_RETRIES=${SYNC_RETRIES:-8}
+SYNC_RETRY_SLEEP=${SYNC_RETRY_SLEEP:-15}
+SYNC_RETRY_SLEEP_MAX=${SYNC_RETRY_SLEEP_MAX:-300}
+
+STOPPING=0
+CHILD_PID=
+
+log() {
+	echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+warn() {
+	echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+on_signal() {
+	STOPPING=1
+	if [ -n "$CHILD_PID" ]; then
+		kill "$CHILD_PID" 2>/dev/null
+	fi
+	log "收到退出信号, 停止中"
+	exit 0
+}
+
+trap on_signal TERM INT
+
+# 生成 /etc/rsyncd.conf 与认证文件, 内容与默认值下的旧镜像完全一致.
+# 已经存在且包含当前 module 的文件 (例如挂载进去的) 沿用; 内容对不上就重写, 写不进去直接报错退出,
+# 避免拿一份不含 [$SYNC_MODULE] 的配置把守护进程启动起来.
+init_config() {
+	umask 077
+	if [ -f /etc/rsyncd.conf ] && grep -q "^\[$SYNC_MODULE\]" /etc/rsyncd.conf; then
+		log "沿用已有的 /etc/rsyncd.conf (module=$SYNC_MODULE)"
+	else
+		cat > /etc/rsyncd.conf <<EOF
+uid = nobody
+gid = nobody
+read only = yes
+use chroot = false
+max connections = 20
+timeout = 180
+log format = "%o %h [%a] %m (%u) %f %l"
+
+[$SYNC_MODULE]
+path = $SYNC_PATH
+auth users = $SYNC_USER
+secrets file = /etc/rsyncd.secrets
+EOF
+		chmod 644 /etc/rsyncd.conf
+		log "已生成 /etc/rsyncd.conf (module=$SYNC_MODULE path=$SYNC_PATH user=$SYNC_USER)"
+	fi
+	if [ "$(cat /etc/rsyncd.secrets 2>/dev/null)" != "$SYNC_USER:$SYNC_PASSWORD" ]; then
+		printf '%s:%s\n' "$SYNC_USER" "$SYNC_PASSWORD" > /etc/rsyncd.secrets || {
+			warn "无法写入 /etc/rsyncd.secrets"
+			exit 1
+		}
+		chmod 600 /etc/rsyncd.secrets
+	fi
+	if [ "$(cat /etc/rsync.secrets 2>/dev/null)" != "$SYNC_PASSWORD" ]; then
+		printf '%s\n' "$SYNC_PASSWORD" > /etc/rsync.secrets || {
+			warn "无法写入 /etc/rsync.secrets"
+			exit 1
+		}
+		chmod 600 /etc/rsync.secrets
+	fi
+}
+
+# 服务端启动前确认配置真的带了当前 module
+check_server_config() {
+	if ! grep -q "^\[$SYNC_MODULE\]" /etc/rsyncd.conf; then
+		warn "/etc/rsyncd.conf 里没有 [$SYNC_MODULE] 段, 服务端无法启动"
+		exit 1
+	fi
+}
+
+# 可被信号打断的 sleep: 作为子进程等待, 收到 TERM/INT 时 trap 里直接退出
+sleep_bg() {
+	sleep "$1" &
+	CHILD_PID=$!
+	wait "$CHILD_PID"
+	CHILD_PID=
+}
+
+# 同步一轮. $1 为最大尝试次数, 0 表示一直重试 (首次同步用它等对端就绪)
+sync_loop() {
+	max_attempts=$1
+	attempt=0
+	sleep_time=$SYNC_RETRY_SLEEP
+	while :; do
+		attempt=$((attempt + 1))
+		started=$(date +%s)
+		rsync \
+			--password-file=/etc/rsync.secrets \
+			--checksum \
+			--archive \
+			--recursive \
+			--delete \
+			--force \
+			--compress \
+			--bwlimit="$SYNC_BWLIMIT" \
+			"${SYNC_USER}@${SERVER}::${SYNC_MODULE}" \
+			"$SYNC_PATH" &
+		CHILD_PID=$!
+		wait "$CHILD_PID"
+		exit_code=$?
+		CHILD_PID=
+		if [ "$STOPPING" -eq 1 ]; then
+			return 1
+		fi
+		if [ "$exit_code" -eq 0 ]; then
+			log "同步完成 (第 $attempt 次尝试, 用时 $(($(date +%s) - started)) 秒)"
+			return 0
+		fi
+		warn "同步失败 (退出码 $exit_code, 第 $attempt 次尝试)"
+		if [ "$max_attempts" -ne 0 ] && [ "$attempt" -ge "$max_attempts" ]; then
+			warn "已达到最大尝试次数 $max_attempts, 本轮放弃"
+			return 1
+		fi
+		warn "$sleep_time 秒后重试"
+		sleep_bg "$sleep_time"
+		if [ "$STOPPING" -eq 1 ]; then
+			return 1
+		fi
+		sleep_time=$((sleep_time + SYNC_RETRY_SLEEP))
+		if [ "$sleep_time" -gt "$SYNC_RETRY_SLEEP_MAX" ]; then
+			sleep_time=$SYNC_RETRY_SLEEP_MAX
+		fi
+	done
+}
+
+run_server() {
+	init_config
+	check_server_config
+	log "服务端启动: module=$SYNC_MODULE path=$SYNC_PATH port=873 bwlimit=${SYNC_BWLIMIT}KB/s"
+	exec rsync --daemon --no-detach --bwlimit="$SYNC_BWLIMIT" --log-file=/dev/stdout
+}
+
+run_client() {
+	if [ -z "${SERVER:-}" ]; then
+		warn "客户端模式需要 SERVER 环境变量, 例如 SERVER=rsync.example.com"
+		exit 1
+	fi
+	init_config
+	log "客户端启动: ${SYNC_USER}@${SERVER}::${SYNC_MODULE} -> $SYNC_PATH (bwlimit=${SYNC_BWLIMIT}KB/s)"
+	if ! sync_loop 0; then
+		[ "$STOPPING" -eq 1 ] && exit 0
+		exit 1
+	fi
+	log "首次同步完成, 之后每 $SYNC_INTERVAL 秒同步一次 (单轮最多尝试 $SYNC_RETRIES 次)"
+	while [ "$STOPPING" -eq 0 ]; do
+		sleep_bg "$SYNC_INTERVAL"
+		if [ "$STOPPING" -eq 0 ]; then
+			sync_loop "$SYNC_RETRIES"
+		fi
+	done
+	exit 0
+}
+
+case "${1:-server}" in
+server)
+	run_server
+	;;
+client)
+	run_client
+	;;
+*)
+	warn "未知参数: $1 (可用: server / client)"
+	exit 1
+	;;
+esac
